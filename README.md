@@ -58,7 +58,7 @@ A **priority-aware search strategy** embedded inside an MPC loop:
 
 - At each time step, score every vehicle using a composite cost function
 - Restrict the search to the **top-3 priority vehicles** only
-- Evaluate only `2³ = 8` lane-change combinations instead of the full combinatorial space
+- Evaluate only `2^3 = 8` lane-change combinations instead of the full combinatorial space
 - Guarantee collision safety through **Artificial Potential Field (APF)** penalties
 - Execute the full loop in **< 2.1 s** for up to 15 vehicles
 
@@ -95,8 +95,8 @@ A **priority-aware search strategy** embedded inside an MPC loop:
 │                         │                                    │
 │  ┌──────────────────────▼───────────────────────────────┐   │
 │  │  Stage B: Priority Ranking (Algorithm 2)             │   │
-│  │  → Score each vehicle with j₁, j₂, j₃               │   │
-│  │  → Select top-3 candidates: O₁, O₂, O₃              │   │
+│  │  → Score each vehicle with j1, j2, j3               │   │
+│  │  → Select top-3 candidates: O1, O2, O3              │   │
 │  └──────────────────────┬───────────────────────────────┘   │
 │                         │                                    │
 │  ┌──────────────────────▼───────────────────────────────┐   │
@@ -124,22 +124,28 @@ A **priority-aware search strategy** embedded inside an MPC loop:
 
 ### Lane-Change Dynamics (Sigmoid Model)
 
-The lateral position during a lane change is modeled with a **sigmoid function** that naturally enforces smooth transitions:
+The lateral position during a lane change is modeled with a **sigmoid function** that naturally enforces smooth transitions.
 
+**Lateral position:**
+
+```math
+y(t) = d_lat * sigma(t)
 ```
-y(t)    = d_lat * sigma(t)
 
+**Sigmoid definition:**
+
+```math
 sigma(t) = 1 / (1 + exp(-k_sig * (t - t0)))
 ```
 
-The sharpness parameter `k_sig` is bounded by both lateral acceleration and jerk limits:
+**Sharpness parameter bounds** — `k_sig` is constrained by both lateral acceleration and jerk limits:
 
-```
-k_sig_acc  = sqrt(6*sqrt(3) * a_y_max / d_lat)
+```math
+k_sig_acc  = sqrt( 6*sqrt(3) * a_y_max / d_lat )
 
-k_sig_jerk = (j_y_max / (C * d_lat))^(1/3)      [C ~ 0.096]
+k_sig_jerk = ( j_y_max / (C * d_lat) )^(1/3)    where C ~ 0.096
 
-k_sig      = min(k_sig_acc, k_sig_jerk)
+k_sig      = min( k_sig_acc , k_sig_jerk )
 ```
 
 **Desirable properties of the sigmoid model:**
@@ -153,64 +159,95 @@ k_sig      = min(k_sig_acc, k_sig_jerk)
 
 ### Priority-Based Search Strategy
 
-Each vehicle `i_veh` is scored with a composite priority cost:
+Each vehicle is scored with a composite priority cost:
 
+```math
+J_vec(i) = j1(i) + alpha2 * j2(i) + alpha3 * j3(i)
 ```
-J_vec(i_veh) = j1 + alpha2 * j2 + alpha3 * j3
+
+The three penalty terms are defined as:
+
+**`j1` — Speed deficit** (how urgently the vehicle needs to change lanes):
+```math
+j1(i) = ( Vel(i) - V_des(i) )^2
 ```
 
-| Term | Formula | Meaning |
-|------|---------|---------|
-| `j1` | `(Vel(i_veh) - V_des(i_veh))^2` | Speed deficit — how urgently this vehicle needs to change lanes |
-| `j2` | `(x_safe_back2 / dist_back2)^N + (x_safe_front2 / dist_front2)^N` | Density/crowding in the **current** lane |
-| `j3` | `(dist_back3 / x_safe_back3)^N + (dist_front3 / x_safe_front3)^N` | Gap availability in the **target** lane |
+**`j2` — Current-lane crowding** (density of vehicles in the present lane):
+```math
+j2(i) = ( x_safe_back2 / dist_back2 )^N  +  ( x_safe_front2 / dist_front2 )^N
+```
 
-Weights `alpha2 = alpha3 = 1` are selected via systematic simulation-based tuning. A safety override sets `J_vec = -1` (no lane change permitted) whenever the target lane gap is insufficient.
+**`j3` — Target-lane gap** (availability of space in the adjacent lane):
+```math
+j3(i) = ( dist_back3 / x_safe_back3 )^N  +  ( dist_front3 / x_safe_front3 )^N
+```
 
-The three highest-scoring vehicles `{O1, O2, O3}` become the lane-change candidates for the current time step.
+> **Safety override:** if the target lane gap is insufficient, `J_vec(i) = -1` and no lane change is permitted for that vehicle.
+
+Weights `alpha2 = alpha3 = 1` were selected via systematic simulation-based tuning. The three highest-scoring vehicles `{O1, O2, O3}` become the lane-change candidates for the current time step.
 
 ---
 
 ### MPC Cost Function
 
-The total cost minimized at each receding-horizon step:
+The total cost minimized at each receding-horizon step combines five terms:
 
-```
-J = J1 + J_antiLock + J_col
-      + w5 * ||L_vec - L_vec0||^2
-      + w6 * ||(U_old - U(it)) / m||^2
+```math
+J = J1 + J_antiLock + J_col + J_lane + J_jerk
 ```
 
-| Term | Role |
-|------|------|
-| `J1 = w1*\|\|Vel - V_des\|\|^2 + w2*\|\|U/m\|\|^2` | Speed tracking + input energy |
-| `J_antiLock` | Deadlock prevention for left-lane vehicles whose desired speed < actual speed |
-| `J_col` | APF-based collision avoidance penalty |
-| `w5 * \|\|L_vec - L_vec0\|\|^2` | Penalizes unnecessary lane changes |
-| `w6 * \|\|(U_old - U(it))/m\|\|^2` | Jerk minimization (smoothness) |
+Where each term is:
+
+**`J1` — Speed tracking and control effort:**
+```math
+J1 = w1 * norm(Vel - V_des)^2  +  w2 * norm(U/m)^2
+```
+
+**`J_antiLock` — Deadlock prevention:**
+Penalizes left-lane vehicles whose actual speed exceeds their desired speed, allowing them to decelerate without causing gridlock.
+
+**`J_col` — APF collision avoidance:**
+Smooth repulsive penalty based on Artificial Potential Fields (see section below).
+
+**`J_lane` — Unnecessary lane-change penalty:**
+```math
+J_lane = w5 * norm(L_vec - L_vec0)^2
+```
+
+**`J_jerk` — Smoothness / jerk minimization:**
+```math
+J_jerk = w6 * norm( (U_old - U(t)) / m )^2
+```
 
 ---
 
 ### APF Collision Avoidance
 
-An Artificial Potential Field penalty `J_c1` between vehicles A and B in the same lane:
+The collision penalty `J_col` is computed for every pair of vehicles (A, B). When vehicle B is ahead of A in the same lane and within the danger zone:
 
-```
-Condition: |xB0 - xA0| <= sigma * x_safe   AND   xB > xA0
-
-  x_safe_dyn = x_safe0 + w_xsafe * (vB0 - vA0) * sign(xA0 - xB0)
-
-  F1   = ( (xA - xB) / (x_safe_dyn * sigma) )^2
-  J_c1 = F1^N / (F1^N + eps1)        % smooth bounded repulsion in [0, 1)
-
-  % Amplify penalty when vehicles are already closer than x_safe:
-  if |xA0 - xB0| < x_safe:
-      J_c1 = J_c1 * c_col
+**Trigger condition:**
+```math
+abs(xB0 - xA0) <= sigma * x_safe   AND   xB > xA0
 ```
 
-> **Why this works:** `F1^N / (F1^N + eps1)` is a smooth sigmoid-like function that rises steeply as the inter-vehicle gap shrinks below `x_safe`, approaching 1 (maximum penalty) without a discontinuity. This avoids the local-minimum instability of classical gradient-based APF methods.
+**Dynamic safe distance** (speed-dependent):
+```math
+x_safe_dyn = x_safe0 + w_xsafe * (vB0 - vA0) * sign(xA0 - xB0)
+```
 
-This formulation produces a **smooth, differentiable** repulsive potential that approaches a hard wall as vehicles close in, without the local-minimum issues of classical APF methods.
+**Repulsive potential:**
+```math
+F1   = ( (xA - xB) / (x_safe_dyn * sigma) )^2
+
+J_c1 = F1^N / (F1^N + eps1)        % bounded in [0, 1)
+```
+
+**Near-collision amplification** — if vehicles are already closer than `x_safe`:
+```math
+J_c1 = J_c1 * c_col
+```
+
+> **Why this works:** The expression `F1^N / (F1^N + eps1)` behaves like a smooth step function. As the gap closes below `x_safe`, it rises steeply toward 1 (maximum repulsion) without any discontinuity, avoiding the local-minimum instability of classical gradient-based APF methods.
 
 ---
 
@@ -336,8 +373,8 @@ The consistent ~8x ratio between total and MPC-only runtime confirms the `(n_set
 | `t_span` | 5 s | Control input update time |
 | `d` | 3 m | Vehicle length |
 | `m` | 1 kg | Vehicle mass (normalized) |
-| `x_safe,0` | 5 m | Minimum safe following distance |
-| `u_min` | −20 N | Maximum braking force |
+| `x_safe0` | 5 m | Minimum safe following distance |
+| `u_min` | -20 N | Maximum braking force |
 | `u_max` | 5 N | Maximum acceleration force |
 
 ### Controller Weights
@@ -345,14 +382,14 @@ The consistent ~8x ratio between total and MPC-only runtime confirms the `(n_set
 | Symbol | Value | Role |
 |--------|-------|------|
 | `alpha2, alpha3` | 1 | Lane density / target-lane safety balance |
-| `w₁` | 0.1 | Speed tracking |
-| `w₃` | 500 | APF collision repulsion |
-| `w₄` | 1000 | APF collision base |
-| `w₅` | 20 | Unnecessary lane-change penalty |
-| `w₆` | 200 | Jerk smoothness |
+| `w1` | 0.1 | Speed tracking |
+| `w3` | 500 | APF collision repulsion |
+| `w4` | 1000 | APF collision base |
+| `w5` | 20 | Unnecessary lane-change penalty |
+| `w6` | 200 | Jerk smoothness |
 | `W_antiLock` | 1 | Deadlock prevention |
 | `c_col` | 1000 | Near-collision amplification |
-| `w_xsafe` | 1/4 | Safe distance speed-dependent scaling |
+| `w_xsafe` | 0.25 | Safe distance speed-dependent scaling |
 | `N` | 2 | APF exponent |
 | `N2` | 12 | Density exponent |
 | `eps1` | 0.001 | APF numerical regularization |
@@ -373,8 +410,8 @@ The consistent ~8x ratio between total and MPC-only runtime confirms the `(n_set
 ├── algorithms/
 │   ├── Algorithm1_SetL.m           # Stage A: Generate lane option sets
 │   ├── Algorithm2_Priority.m       # Stage B: Priority vehicle selection
-│   ├── Algorithm2_1_j2.m           # Calculating current-lane density cost j₂
-│   ├── Algorithm2_2_j3.m           # Calculating target-lane gap cost j₃
+│   ├── Algorithm2_1_j2.m           # Calculating current-lane density cost j2
+│   ├── Algorithm2_2_j3.m           # Calculating target-lane gap cost j3
 │   ├── Algorithm2_3_IndVLC.m       # Tracking vehicles during lane change
 │   ├── Algorithm3_Cost.m           # Stage C: MPC cost function J
 │   ├── Algorithm3_1_antiLock.m     # Deadlock prevention cost
