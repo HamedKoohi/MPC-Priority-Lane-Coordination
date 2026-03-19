@@ -124,130 +124,62 @@ A **priority-aware search strategy** embedded inside an MPC loop:
 
 ### Lane-Change Dynamics (Sigmoid Model)
 
-The lateral position during a lane change is modeled with a **sigmoid function** that naturally enforces smooth transitions.
+Rather than assuming lane changes happen instantaneously — a common simplification in high-level planning — this work models the lateral maneuver as a finite-duration trajectory governed by a **sigmoid function**. The sigmoid is chosen because it naturally produces a smooth S-shaped path that starts and ends with zero slope, eliminating any abrupt steering inputs at the moment the maneuver begins or completes.
 
-**Lateral position:**
+The sharpness of the sigmoid — how aggressively the vehicle cuts across lanes — is controlled by a single parameter `k_sig`. This parameter is not freely chosen: it is automatically bounded from above by two physical limits derived from the vehicle dynamics. The first limit comes from the maximum allowable lateral acceleration the passengers can tolerate; the second from the maximum allowable lateral jerk (rate of change of acceleration). The tighter of the two constraints is enforced, ensuring that every generated trajectory is both comfortable and dynamically feasible regardless of lane width or vehicle speed.
 
-```math
-y(t) = d_lat * sigma(t)
-```
-
-**Sigmoid definition:**
-
-```math
-sigma(t) = 1 / (1 + exp(-k_sig * (t - t0)))
-```
-
-**Sharpness parameter bounds** — `k_sig` is constrained by both lateral acceleration and jerk limits:
-
-```math
-k_sig_acc  = sqrt( 6*sqrt(3) * a_y_max / d_lat )
-
-k_sig_jerk = ( j_y_max / (C * d_lat) )^(1/3)    where C ~ 0.096
-
-k_sig      = min( k_sig_acc , k_sig_jerk )
-```
-
-**Desirable properties of the sigmoid model:**
-- ✅ Smooth continuous transition between lanes
-- ✅ Zero slope at start and end (no sudden steering inputs)
-- ✅ Continuous velocity and acceleration profiles
-- ✅ Tunable aggressiveness via `k_sig`
-- ✅ Physically feasible — satisfies lateral jerk constraints
+**Key properties of the sigmoid lane-change model:**
+- ✅ Smooth, continuous transition between lanes with no abrupt steering
+- ✅ Zero slope at the start and end of the maneuver
+- ✅ Continuous velocity and acceleration profiles throughout
+- ✅ Aggressiveness is tunable and automatically bounded by physical limits
+- ✅ Satisfies both lateral acceleration and lateral jerk constraints
 
 ---
 
 ### Priority-Based Search Strategy
 
-Each vehicle is scored with a composite priority cost:
+At each time step the centralized planner must decide which vehicles should change lanes. Because the total number of lane-change combinations grows exponentially with the number of vehicles, solving the full problem in real time is infeasible. The priority strategy reduces this to a tractable subproblem in two steps.
 
-```math
-J_vec(i) = j1(i) + alpha2 * j2(i) + alpha3 * j3(i)
-```
+**Step 1 — Score every vehicle.** Each vehicle receives a scalar priority score built from three weighted components:
 
-The three penalty terms are defined as:
+- **Speed deficit (`j1`):** How far the vehicle's current speed is from its desired speed. A large gap means the vehicle is being blocked and urgently needs to move to a faster or less crowded lane.
+- **Current-lane crowding (`j2`):** How tightly packed the surrounding vehicles are in the vehicle's present lane, measured using the front and rear gaps normalized by the required safe distance. A high score indicates a congested lane that the vehicle should leave.
+- **Target-lane availability (`j3`):** How much clear space exists in the adjacent lane, again measured by normalized front and rear gaps. A high score indicates a safe and open lane to move into.
 
-**`j1` — Speed deficit** (how urgently the vehicle needs to change lanes):
-```math
-j1(i) = ( Vel(i) - V_des(i) )^2
-```
+A safety override is applied last: if the adjacent lane does not provide a sufficiently safe gap, the vehicle is marked as ineligible for lane changing regardless of its other scores.
 
-**`j2` — Current-lane crowding** (density of vehicles in the present lane):
-```math
-j2(i) = ( x_safe_back2 / dist_back2 )^N  +  ( x_safe_front2 / dist_front2 )^N
-```
+**Step 2 — Select the top three.** Vehicles are ranked by their priority scores in descending order. Only the three highest-priority vehicles — call them `O1`, `O2`, and `O3` — are considered for lane-change optimization at the current time step. All other vehicles maintain their current lane. This reduces the search space from an exponentially large set to at most `2^3 = 8` candidate lane combinations, which can be evaluated exhaustively in real time.
 
-**`j3` — Target-lane gap** (availability of space in the adjacent lane):
-```math
-j3(i) = ( dist_back3 / x_safe_back3 )^N  +  ( dist_front3 / x_safe_front3 )^N
-```
-
-> **Safety override:** if the target lane gap is insufficient, `J_vec(i) = -1` and no lane change is permitted for that vehicle.
-
-Weights `alpha2 = alpha3 = 1` were selected via systematic simulation-based tuning. The three highest-scoring vehicles `{O1, O2, O3}` become the lane-change candidates for the current time step.
+The weights balancing the three score components (`alpha2 = alpha3 = 1`) were determined through systematic simulation experiments, ensuring that neither congestion response nor safety assessment dominates the other.
 
 ---
 
 ### MPC Cost Function
 
-The total cost minimized at each receding-horizon step combines five terms:
+The MPC optimizer selects acceleration and braking commands for all vehicles by minimizing a composite cost function over a finite prediction horizon. The cost function has five distinct terms, each targeting a specific behavior:
 
-```math
-J = J1 + J_antiLock + J_col + J_lane + J_jerk
-```
+**Speed tracking (`J1`):** Penalizes the squared difference between each vehicle's actual speed and its desired speed, plus a small regularization on the control effort. This is the primary objective — all vehicles should converge to their assigned target speeds.
 
-Where each term is:
+**Deadlock prevention (`J_antiLock`):** During simultaneous lane changes, vehicles in the left lane can become trapped if their desired speed is lower than their current speed and there is no room to decelerate without collision. This term detects such configurations and applies a penalty that encourages the slower vehicle to yield space, breaking the deadlock before it forms.
 
-**`J1` — Speed tracking and control effort:**
-```math
-J1 = w1 * norm(Vel - V_des)^2  +  w2 * norm(U/m)^2
-```
+**Collision avoidance (`J_col`):** An Artificial Potential Field (APF) penalty that rises steeply as any two vehicles approach within the safe following distance. Described in detail in the next section.
 
-**`J_antiLock` — Deadlock prevention:**
-Penalizes left-lane vehicles whose actual speed exceeds their desired speed, allowing them to decelerate without causing gridlock.
+**Lane-change suppression (`J_lane`):** Penalizes deviations of the lane vector from its previous value, discouraging unnecessary or oscillatory lane changes that do not improve traffic flow.
 
-**`J_col` — APF collision avoidance:**
-Smooth repulsive penalty based on Artificial Potential Fields (see section below).
+**Jerk minimization (`J_jerk`):** Penalizes large changes in control input between consecutive time steps, directly limiting the longitudinal jerk experienced by passengers and reducing actuator wear.
 
-**`J_lane` — Unnecessary lane-change penalty:**
-```math
-J_lane = w5 * norm(L_vec - L_vec0)^2
-```
-
-**`J_jerk` — Smoothness / jerk minimization:**
-```math
-J_jerk = w6 * norm( (U_old - U(t)) / m )^2
-```
+All five terms are summed with individually tuned weights, giving the designer direct control over the trade-off between speed convergence, comfort, safety margin, and lane stability.
 
 ---
 
 ### APF Collision Avoidance
 
-The collision penalty `J_col` is computed for every pair of vehicles (A, B). When vehicle B is ahead of A in the same lane and within the danger zone:
+The APF collision penalty is evaluated for every pair of vehicles that share a lane or are in the process of merging into the same lane. The key design requirement is that the penalty must be **smooth and differentiable** everywhere so that gradient-based MPC optimizers can handle it reliably — classical APF formulations that use hard walls or discontinuous potentials cause the optimizer to get stuck in local minima.
 
-**Trigger condition:**
-```math
-abs(xB0 - xA0) <= sigma * x_safe   AND   xB > xA0
-```
+The approach works as follows. For any two vehicles A (behind) and B (ahead), the safe following distance is first made **speed-dependent**: faster closing speeds require a larger buffer. When the actual gap falls within the danger zone defined by this dynamic safe distance, a smooth repulsive cost is activated. The cost is designed as a rational function of the normalized gap that is bounded between zero and one, rises steeply as the gap approaches zero, and remains differentiable throughout. If the vehicles are already closer than the base safe distance — indicating an imminent collision risk — the penalty is amplified by a large constant factor to make collision avoidance the optimizer's absolute top priority at that step.
 
-**Dynamic safe distance** (speed-dependent):
-```math
-x_safe_dyn = x_safe0 + w_xsafe * (vB0 - vA0) * sign(xA0 - xB0)
-```
-
-**Repulsive potential:**
-```math
-F1   = ( (xA - xB) / (x_safe_dyn * sigma) )^2
-
-J_c1 = F1^N / (F1^N + eps1)        % bounded in [0, 1)
-```
-
-**Near-collision amplification** — if vehicles are already closer than `x_safe`:
-```math
-J_c1 = J_c1 * c_col
-```
-
-> **Why this works:** The expression `F1^N / (F1^N + eps1)` behaves like a smooth step function. As the gap closes below `x_safe`, it rises steeply toward 1 (maximum repulsion) without any discontinuity, avoiding the local-minimum instability of classical gradient-based APF methods.
+This formulation gives the MPC the information it needs to steer away from collisions predictively, over the full planning horizon, rather than reactively at the moment of danger.
 
 ---
 
