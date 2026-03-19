@@ -44,7 +44,7 @@
 This repository accompanies the paper:
 
 > **"Scalable Cooperative Lane-Change Management for Connected Autonomous Vehicles Using MPC-Based Decision Coordination"**  
-> *Hamed Kouhi, Georg Schildbach — Scientific Reports, 2024*
+> *Hamed Kouhi, Georg Schildbach — Scientific Reports, 2026*
 
 Connected autonomous vehicles (CAVs) can cooperate via vehicle-to-infrastructure (V2I) communication to achieve traffic-level efficiency that no single vehicle can attain alone. Most existing work addresses lane changes for a **single ego vehicle**. This paper fills the gap by presenting a **centralized framework** that jointly optimizes lane assignments and speed profiles for **all vehicles simultaneously** on a multi-lane highway.
 
@@ -72,7 +72,7 @@ A **priority-aware search strategy** embedded inside an MPC loop:
 | **Priority-based search** | Reduces exponential mixed-integer complexity to a fixed 8-combination search, enabling real-time feasibility |
 | **Finite-duration lane model** | Replaces the common instantaneous lane-change assumption with a sigmoid-based lateral trajectory that respects acceleration and jerk limits |
 | **Deadlock prevention** | Cost function penalizes vehicles lingering in the left lane, preventing deadlocks during simultaneous multi-vehicle maneuvers |
-| **Scalable architecture** | Total runtime scales as `O(n_set,L³)` rather than exponentially with vehicle count |
+| **Scalable architecture** | Total runtime scales as `O(n_set_L^3)` rather than exponentially with vehicle count |
 
 ---
 
@@ -127,18 +127,19 @@ A **priority-aware search strategy** embedded inside an MPC loop:
 The lateral position during a lane change is modeled with a **sigmoid function** that naturally enforces smooth transitions:
 
 ```
-y(t) = d_lat · σ(t)
+y(t)    = d_lat * sigma(t)
 
-where  σ(t) = 1 / (1 + exp(−k_sig · (t − t₀)))
+sigma(t) = 1 / (1 + exp(-k_sig * (t - t0)))
 ```
 
 The sharpness parameter `k_sig` is bounded by both lateral acceleration and jerk limits:
 
 ```
-k_sig,acc  = sqrt(6√3 · a_y,max / d_lat)
-k_sig,jerk = (j_y,max / (C · d_lat))^(1/3)    [C ≈ 0.096]
+k_sig_acc  = sqrt(6*sqrt(3) * a_y_max / d_lat)
 
-k_sig = min(k_sig,acc , k_sig,jerk)
+k_sig_jerk = (j_y_max / (C * d_lat))^(1/3)      [C ~ 0.096]
+
+k_sig      = min(k_sig_acc, k_sig_jerk)
 ```
 
 **Desirable properties of the sigmoid model:**
@@ -155,18 +156,18 @@ k_sig = min(k_sig,acc , k_sig,jerk)
 Each vehicle `i_veh` is scored with a composite priority cost:
 
 ```
-J_vec(i_veh) = j₁ + α₂·j₂ + α₃·j₃
+J_vec(i_veh) = j1 + alpha2 * j2 + alpha3 * j3
 ```
 
 | Term | Formula | Meaning |
 |------|---------|---------|
-| `j₁` | `(Vel(i_veh) − V_des(i_veh))²` | Speed deficit — how urgently this vehicle needs to change lanes |
-| `j₂` | `(x_safe,back2 / dist_back2)^N + (x_safe,front2 / dist_front2)^N` | Density/crowding in the **current** lane |
-| `j₃` | `(dist_back3 / x_safe,back3)^N + (dist_front3 / x_safe,front3)^N` | Gap availability in the **target** lane |
+| `j1` | `(Vel(i_veh) - V_des(i_veh))^2` | Speed deficit — how urgently this vehicle needs to change lanes |
+| `j2` | `(x_safe_back2 / dist_back2)^N + (x_safe_front2 / dist_front2)^N` | Density/crowding in the **current** lane |
+| `j3` | `(dist_back3 / x_safe_back3)^N + (dist_front3 / x_safe_front3)^N` | Gap availability in the **target** lane |
 
-Weights `α₂ = α₃ = 1` are selected via systematic simulation-based tuning. A safety override sets `J_vec = −1` (no lane change permitted) whenever the target lane gap is insufficient.
+Weights `alpha2 = alpha3 = 1` are selected via systematic simulation-based tuning. A safety override sets `J_vec = -1` (no lane change permitted) whenever the target lane gap is insufficient.
 
-The three highest-scoring vehicles `{O₁, O₂, O₃}` become the lane-change candidates for the current time step.
+The three highest-scoring vehicles `{O1, O2, O3}` become the lane-change candidates for the current time step.
 
 ---
 
@@ -175,16 +176,18 @@ The three highest-scoring vehicles `{O₁, O₂, O₃}` become the lane-change c
 The total cost minimized at each receding-horizon step:
 
 ```
-J = J₁ + J_antiLock + J_col + w₅‖L_vec − L_vec,0‖² + w₆‖(U_old − U(it))/m‖²
+J = J1 + J_antiLock + J_col
+      + w5 * ||L_vec - L_vec0||^2
+      + w6 * ||(U_old - U(it)) / m||^2
 ```
 
 | Term | Role |
 |------|------|
-| `J₁ = w₁‖Vel − V_des‖² + w₂‖U/m‖²` | Speed tracking + input energy |
+| `J1 = w1*\|\|Vel - V_des\|\|^2 + w2*\|\|U/m\|\|^2` | Speed tracking + input energy |
 | `J_antiLock` | Deadlock prevention for left-lane vehicles whose desired speed < actual speed |
 | `J_col` | APF-based collision avoidance penalty |
-| `w₅‖L_vec − L_vec,0‖²` | Penalizes unnecessary lane changes |
-| `w₆‖(U_old − U(it))/m‖²` | Jerk minimization (smoothness) |
+| `w5 * \|\|L_vec - L_vec0\|\|^2` | Penalizes unnecessary lane changes |
+| `w6 * \|\|(U_old - U(it))/m\|\|^2` | Jerk minimization (smoothness) |
 
 ---
 
@@ -193,14 +196,19 @@ J = J₁ + J_antiLock + J_col + w₅‖L_vec − L_vec,0‖² + w₆‖(U_old �
 An Artificial Potential Field penalty `J_c1` between vehicles A and B in the same lane:
 
 ```
-If |x_B0 − x_A0| ≤ σ·x_safe  and  x_B > x_A0:
+Condition: |xB0 - xA0| <= sigma * x_safe   AND   xB > xA0
 
-  F₁ = ((x_A − x_B) / (x_safe × σ))²
-  J_c1 = F₁^N / (F₁^N + ε₁)          ← smooth, bounded repulsion
+  x_safe_dyn = x_safe0 + w_xsafe * (vB0 - vA0) * sign(xA0 - xB0)
 
-  If |x_A0 − x_B0| < x_safe:
-    J_c1 ← J_c1 × c_col               ← amplified near-collision penalty
+  F1   = ( (xA - xB) / (x_safe_dyn * sigma) )^2
+  J_c1 = F1^N / (F1^N + eps1)        % smooth bounded repulsion in [0, 1)
+
+  % Amplify penalty when vehicles are already closer than x_safe:
+  if |xA0 - xB0| < x_safe:
+      J_c1 = J_c1 * c_col
 ```
+
+> **Why this works:** `F1^N / (F1^N + eps1)` is a smooth sigmoid-like function that rises steeply as the inter-vehicle gap shrinks below `x_safe`, approaching 1 (maximum penalty) without a discontinuity. This avoids the local-minimum instability of classical gradient-based APF methods.
 
 This formulation produces a **smooth, differentiable** repulsive potential that approaches a hard wall as vehicles close in, without the local-minimum issues of classical APF methods.
 
@@ -277,11 +285,11 @@ All simulations run in **MATLAB R2020b** with 6 vehicles on a two-lane one-way h
 Total runtime scales as:
 
 ```
-Total Runtime ≈ (n_set,L)³ × (MPC Runtime for longitudinal control)
+Total Runtime = (n_set_L)^3 * (MPC Runtime for longitudinal control)
               + (Priority Logic Runtime)
 ```
 
-With `n_set,L = 2` → only **8 MPC evaluations** per time step, regardless of total vehicle count.
+With `n_set_L = 2` → only **8 MPC evaluations** per time step, regardless of total vehicle count.
 
 ### Measured Runtimes
 
@@ -295,7 +303,7 @@ With `n_set,L = 2` → only **8 MPC evaluations** per time step, regardless of t
 | 6 | 1 | 12 | 1.72 | 0.210 | ~8.2× |
 | 7 | 1 | 15 | 2.10 | 0.250 | ~8.4× |
 
-The consistent ~8× ratio between total and MPC-only runtime confirms the `(n_set,L)³ = 8` scaling, as opposed to the **exponential** growth of full mixed-integer optimization.
+The consistent ~8x ratio between total and MPC-only runtime confirms the `(n_set_L)^3 = 8` scaling, as opposed to the **exponential** growth of full mixed-integer optimization.
 
 ---
 
@@ -336,7 +344,7 @@ The consistent ~8× ratio between total and MPC-only runtime confirms the `(n_se
 
 | Symbol | Value | Role |
 |--------|-------|------|
-| `α₂, α₃` | 1 | Lane density / target-lane safety balance |
+| `alpha2, alpha3` | 1 | Lane density / target-lane safety balance |
 | `w₁` | 0.1 | Speed tracking |
 | `w₃` | 500 | APF collision repulsion |
 | `w₄` | 1000 | APF collision base |
@@ -346,8 +354,8 @@ The consistent ~8× ratio between total and MPC-only runtime confirms the `(n_se
 | `c_col` | 1000 | Near-collision amplification |
 | `w_xsafe` | 1/4 | Safe distance speed-dependent scaling |
 | `N` | 2 | APF exponent |
-| `N₂` | 12 | Density exponent |
-| `ε₁` | 0.001 | APF numerical regularization |
+| `N2` | 12 | Density exponent |
+| `eps1` | 0.001 | APF numerical regularization |
 
 ---
 
@@ -420,12 +428,12 @@ nset_L = 2;                             % Lane options per vehicle (nset,L)
 If you use this code or methodology in your research, please cite:
 
 ```bibtex
-@article{kouhi2024cooperative,
+@article{kouhi2026cooperative,
   title   = {Scalable Cooperative Lane-Change Management for Connected
              Autonomous Vehicles Using MPC-Based Decision Coordination},
   author  = {Kouhi, Hamed and Schildbach, Georg},
   journal = {Scientific Reports},
-  year    = {2024},
+  year    = {2026},
   doi     = {10.xxxx/xxxxxxx}
 }
 ```
